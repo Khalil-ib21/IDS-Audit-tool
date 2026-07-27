@@ -1,0 +1,88 @@
+name: Audit BDNS IDS files
+
+on:
+  push:
+    paths:
+      - 'ids-under-test/**'
+      - '.github/workflows/audit-bdns.yml'
+  workflow_dispatch:
+    inputs:
+      path:
+        description: 'Folder or file to audit'
+        default: 'ids-under-test'
+        required: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Report toolchain
+        run: |
+          dotnet --list-sdks
+          echo "--- global.json ---"
+          cat global.json || echo "(none)"
+
+      - name: Build ids-tool
+        run: dotnet build ids-tool/ids-tool.csproj -c Release --nologo
+
+      - name: List files under test
+        run: |
+          TARGET="${{ github.event.inputs.path || 'ids-under-test' }}"
+          echo "target: $TARGET"
+          ls -la "$TARGET"
+          echo "--- specification counts ---"
+          grep -c '<ids:specification ' "$TARGET"/*.ids || true
+
+      - name: Audit
+        id: audit
+        continue-on-error: true
+        run: |
+          TARGET="${{ github.event.inputs.path || 'ids-under-test' }}"
+          mkdir -p audit-output
+          overall=0
+          for f in "$TARGET"/*.ids; do
+            name="$(basename "$f")"
+            echo "::group::$name"
+            set +e
+            dotnet run --project ids-tool/ids-tool.csproj -c Release --no-build \
+              -- audit "$f" 2>&1 | tee "audit-output/${name%.ids}.txt"
+            rc=${PIPESTATUS[0]}
+            set -e
+            echo "exit code: $rc" | tee -a "audit-output/${name%.ids}.txt"
+            [ "$rc" -ne 0 ] && overall=1
+            echo "::endgroup::"
+          done
+          echo "overall=$overall" >> "$GITHUB_OUTPUT"
+
+      - name: Summarise
+        run: |
+          {
+            echo "## ids-tool audit"
+            echo ""
+            echo "| File | Lines mentioning an error | Exit |"
+            echo "|---|---|---|"
+            for f in audit-output/*.txt; do
+              n=$(grep -ciE 'error|invalid|not (valid|found)' "$f" || true)
+              rc=$(grep -o 'exit code: [0-9-]*' "$f" | tail -1 | tr -dc '0-9-')
+              echo "| $(basename "$f" .txt) | $n | ${rc:-?} |"
+            done
+            echo ""
+            echo "Full output is in the **audit-output** artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit output
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-output
+          path: audit-output/
